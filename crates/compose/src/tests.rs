@@ -816,6 +816,46 @@ fn footnotes_sit_at_the_column_bottom_and_push_text() {
 }
 
 #[test]
+fn footnote_first_line_wraps_at_the_column_edge_after_its_number() {
+    // InDesign sets the footnote number and separator as part of the first line: that line
+    // wraps at the same right edge as the others, whatever the separator. A tab separator
+    // reaches the footnote style's tab stop.
+    let tab_at = |position: f64| {
+        let stop = designcraft_doc::TabStop { position, align: TabAlign::Left, leader: String::new(), align_on: String::new() };
+        ParaAttrs { tabs: Some(vec![stop]), ..Default::default() }
+    };
+    let right_edge = |l: &Line, source: &str| {
+        let space = |g: &&PlacedGlyph| g.len > 0 && source.get(g.byte..).and_then(|s| s.chars().next()).is_some_and(char::is_whitespace);
+        l.glyphs.iter().filter(|g| g.visible && !space(g)).map(|g| g.x + g.adv).fold(0.0, f64::max)
+    };
+    let cases =
+        [("\t", tab_at(100.0)), ("\t", ParaAttrs::default()), (" ", ParaAttrs::default()), (".\u{2003}\u{2003}\u{2003}", ParaAttrs::default())];
+    for (sep, para) in cases {
+        let (mut d, sid, _) = doc_with("Short text.", Rect::new(36.0, 36.0, 300.0, 400.0), ParaAttrs::default());
+        d.footnote_options.separator = sep.into();
+        d.footnote_options.start_at = 1234;
+        d.story_mut(sid).unwrap().insert_note(5, &LOREM.repeat(2), ParaFormat { para, ..Default::default() });
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let n = &cs.frames[0].notes[0];
+        let width = n.rect.width();
+        let lines = &n.text.frames[0].lines;
+        assert!(lines.len() >= 3, "{sep:?}: {} lines", lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            let right = right_edge(l, &n.source);
+            assert!(right <= width + 0.01, "{sep:?}: line {i} ends at {right}, past the column's {width}");
+        }
+        assert!(lines[0].glyphs.first().is_some_and(|g| g.len == 0 && g.x < 1.0), "{sep:?}: the number leads line 0");
+    }
+    // The same holds for a tab in body text.
+    let text = format!("Term\t{LOREM}");
+    let (d, sid, _) = doc_with(&text, Rect::new(36.0, 36.0, 300.0, 400.0), tab_at(100.0));
+    let cs = compose_story(&d, sid, &ComposeOptions::default());
+    let l = &cs.frames[0].lines[0];
+    let edge = cs.frames[0].columns[0].x1;
+    assert!(right_edge(l, &text) <= edge + 0.01, "body line 0 ends at {}, past {edge}", right_edge(l, &text));
+}
+
+#[test]
 fn footnote_line_at_column_top_still_sets() {
     // A note taller than the frame can't push its reference line forever.
     let (mut d, sid, _) = doc_with("Short text.", Rect::new(0.0, 0.0, 200.0, 40.0), ParaAttrs::default());
@@ -1934,6 +1974,62 @@ fn vertical_lines_fit_the_em_box() {
         let (l, col) = vertical_line(family, "一二", |_| {});
         assert!((l.ascent - ascent).abs() < 1e-9 && (l.descent - descent).abs() < 1e-9, "{family}: {} {}", l.ascent, l.descent);
         assert!((l.baseline - col.y0 - ascent).abs() < 1e-9, "{family}: {} {}", l.baseline, col.y0);
+    }
+}
+
+#[test]
+fn list_first_line_wraps_at_the_column_edge_after_its_label() {
+    use designcraft_doc::{ListType, TabStop};
+    // A hanging indent (left 18, first line −18): the label sits at the column start, a tab
+    // after it reaches the left indent (an implicit stop when no explicit stop comes first), and
+    // the first line wraps at the same right edge as the others.
+    let right_edge = |l: &Line, source: &str| {
+        let space = |g: &&PlacedGlyph| g.len > 0 && source.get(g.byte..).and_then(|s| s.chars().next()).is_some_and(char::is_whitespace);
+        l.glyphs.iter().filter(|g| g.visible && !space(g)).map(|g| g.x + g.adv).fold(0.0, f64::max)
+    };
+    let text_start = |l: &Line| l.glyphs.iter().find(|g| g.len > 0 && g.visible).map_or(f64::NAN, |g| g.x);
+    let stop = |position: f64| TabStop { position, align: TabAlign::Left, leader: String::new(), align_on: String::new() };
+    let text = format!("{LOREM}\n{LOREM}");
+    // (list, separator, explicit tab stops, where line 0's text starts past the column start:
+    // None = right after the label, wherever that is).
+    let cases = [
+        (ListType::Bullets, "\t", None, Some(18.0)),
+        (ListType::Numbers, "\t", None, Some(18.0)),
+        (ListType::Numbers, "\t", Some(vec![stop(12.0)]), Some(12.0)),
+        (ListType::Numbers, "\t", Some(vec![stop(30.0)]), Some(18.0)),
+        (ListType::Bullets, " ", None, None),
+        (ListType::Numbers, "\u{2003}", None, None),
+    ];
+    for (list, sep, tabs, first_at) in cases {
+        let para = ParaAttrs {
+            list_type: Some(list),
+            list_separator: Some(sep.into()),
+            left_indent: Some(18.0),
+            first_line_indent: Some(-18.0),
+            tabs: tabs.clone(),
+            ..Default::default()
+        };
+        let (d, sid, _) = doc_with(&text, Rect::new(36.0, 36.0, 300.0, 400.0), para);
+        let cs = compose_story(&d, sid, &ComposeOptions::default());
+        let col = cs.frames[0].columns[0];
+        let lines = &cs.frames[0].lines;
+        let what = format!("{list:?} {sep:?} {tabs:?}");
+        assert!(lines.len() >= 6, "{what}: {} lines", lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            let right = right_edge(l, &text);
+            assert!(right <= col.x1 + 0.01, "{what}: line {i} ends at {right}, past the column's {}", col.x1);
+            let start = text_start(l) - col.x0;
+            if !l.first_in_para {
+                assert!((start - 18.0).abs() < 0.01, "{what}: line {i} text starts at {start}, not the left indent");
+            } else if let Some(at) = first_at {
+                assert!((start - at).abs() < 0.01, "{what}: line {i} text starts at {start}, not {at}");
+            } else {
+                assert!(start > 0.0, "{what}: line {i} text starts at {start}");
+            }
+            if l.first_in_para {
+                assert!(l.glyphs.first().is_some_and(|g| g.len == 0 && (g.x - col.x0).abs() < 0.01), "{what}: the label leads line {i}");
+            }
+        }
     }
 }
 

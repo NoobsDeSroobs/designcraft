@@ -657,7 +657,11 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
                 apply_desired_spacing(&mut gl, &pp);
                 let hy = hyphenation_points(&story.text, &gl, &pp, &hyph_exceptions, &foreign_ranges(doc, story, prange.clone(), &base_chars));
                 let breaks = if pp.composer == Composer::SingleLine || gl.iter().any(|g| g.ch == '\t') || gl.len() > 4000 {
-                    breaker::greedy(&gl, &hy, &spacing, &width)
+                    let tab = |j: usize, x: f64, i: usize| {
+                        let ind = pp.left_indent + if j == 0 { pp.first_line_indent } else { 0.0 };
+                        tab_advance(&pp.tabs, pp.left_indent, ind + x, gl.get(i + 1..).unwrap_or_default()).0
+                    };
+                    breaker::greedy(&gl, &hy, &spacing, &width, &tab)
                 } else if pp.balance_ragged && !spacing.justify {
                     breaker::balanced(&gl, &hy, &spacing, &width)
                 } else {
@@ -836,7 +840,13 @@ fn compose_with_db(doc: &Document, story: &Story, frames: &[FrameSpec], opts: &C
             let rest = &glyphs[g0..];
             let rest_h = &hyph_after[g0..];
             let breaks: Vec<Break> = if pp.composer == Composer::SingleLine || has_tabs || rest.len() > 4000 {
-                breaker::greedy(rest, rest_h, &spacing, &width)
+                // Where each line starts relative to the tab origin, as `layout_line` places it.
+                let tab = |j: usize, x: f64, i: usize| {
+                    let x0 = slots.get(j).map_or(col.x0, |s| s.0);
+                    let ind = pp.left_indent + if line_no + j == 0 { pp.first_line_indent } else { 0.0 };
+                    tab_advance(&pp.tabs, pp.left_indent, x0 + ind + x - col.x0, rest.get(i + 1..).unwrap_or_default()).0
+                };
+                breaker::greedy(rest, rest_h, &spacing, &width, &tab)
             } else if pp.balance_ragged && !spacing.justify {
                 breaker::balanced(rest, rest_h, &spacing, &width)
             } else {
@@ -1866,6 +1876,34 @@ pub fn hj_severity(ratio: f64, min: f64, max: f64) -> u8 {
     }
 }
 
+/// Advance of a tab that starts `abs` from the tab origin and is followed by `after`, and the
+/// explicit tab stop it reaches (none: the left indent or the next default stop, left aligned).
+/// Right, centre and character alignment look at the text up to the next tab or forced break.
+///
+/// The left indent is a left stop of its own: in a hanging indent, the tab after a bullet or
+/// number reaches it unless an explicit stop comes first.
+fn tab_advance<'a>(tabs: &'a [designcraft_doc::TabStop], left_indent: f64, abs: f64, after: &[Glyph]) -> (f64, Option<&'a designcraft_doc::TabStop>) {
+    let indent_ahead = left_indent > abs + 0.01;
+    let stop = tabs.iter().find(|t| t.position > abs + 0.01).filter(|t| !indent_ahead || t.position <= left_indent);
+    let (pos, align) = match stop {
+        Some(t) => (t.position, t.align),
+        None if indent_ahead => (left_indent, TabAlign::Left),
+        None => (((abs / DEFAULT_TAB).floor() + 1.0) * DEFAULT_TAB, TabAlign::Left),
+    };
+    let seg = after.iter().take_while(|g| g.ch != '\t' && !breaker::is_forced(g.ch));
+    let gap = pos - abs;
+    let w = match align {
+        TabAlign::Left => gap,
+        TabAlign::Right => gap - seg.map(|g| g.adv).sum::<f64>(),
+        TabAlign::Center => gap - seg.map(|g| g.adv).sum::<f64>() / 2.0,
+        TabAlign::Char => {
+            let ch = stop.and_then(|t| t.align_on.chars().next()).unwrap_or('.');
+            gap - seg.take_while(|g| g.ch != ch).map(|g| g.adv).sum::<f64>()
+        }
+    };
+    (w.max(0.0), stop)
+}
+
 /// Position glyphs `s..e` within `[x0, x1]`; returns (glyphs, end x, word-space ratio).
 ///
 /// Justified lines distribute the difference to the measure in priority order: word spaces up to
@@ -1905,32 +1943,13 @@ fn layout_line(
     let mut leaders: Vec<(usize, String)> = Vec::new();
     while i < line.len() {
         if line[i].ch == '\t' {
-            let abs = x0 + x - tab_origin;
-            let stop = pp.tabs.iter().find(|t| t.position > abs + 0.01).cloned();
-            if let Some(t) = &stop
+            let (w, stop) = tab_advance(&pp.tabs, pp.left_indent, x0 + x - tab_origin, line.get(i + 1..).unwrap_or_default());
+            if let Some(t) = stop
                 && !t.leader.is_empty()
             {
                 leaders.push((i, t.leader.clone()));
             }
-            let (pos, align) = match &stop {
-                Some(t) => (t.position, t.align),
-                None => (((abs / DEFAULT_TAB).floor() + 1.0) * DEFAULT_TAB, TabAlign::Left),
-            };
-            // Width of the text after this tab up to the next tab / line end.
-            let seg_end = line[i + 1..].iter().position(|g| g.ch == '\t').map_or(line.len(), |p| i + 1 + p);
-            let seg_w: f64 = line[i + 1..seg_end].iter().map(|g| g.adv).sum();
-            let target = pos + tab_origin - x0;
-            let w = match align {
-                TabAlign::Left => target - x,
-                TabAlign::Right => target - x - seg_w,
-                TabAlign::Center => target - x - seg_w / 2.0,
-                TabAlign::Char => {
-                    let ch = stop.as_ref().and_then(|t| t.align_on.chars().next()).unwrap_or('.');
-                    let before: f64 = line[i + 1..seg_end].iter().take_while(|g| g.ch != ch).map(|g| g.adv).sum();
-                    target - x - before
-                }
-            };
-            line[i].adv = w.max(0.0);
+            line[i].adv = w;
         } else if line[i].ch == story::RIGHT_INDENT_TAB {
             let rest: f64 = line[i + 1..].iter().map(|g| g.adv).sum();
             line[i].adv = (measure - x - rest).max(0.0);
