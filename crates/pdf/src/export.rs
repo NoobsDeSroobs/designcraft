@@ -1281,6 +1281,10 @@ fn relabel_pdf_header(data: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn lossless(data: &Arc<Vec<u8>>, fmt: Option<image::ImageFormat>, interpolate: bool) -> Option<Image> {
+    // krilla reads PNG, GIF and WebP lazily: a damaged file is accepted here and fails the whole
+    // export when the PDF is written. Decoding it first means it is skipped, like any other
+    // image that can't be decoded.
+    let rgba = designcraft_images::decode_rgba(data)?;
     let direct = match fmt {
         Some(image::ImageFormat::Png) => Image::from_png(data.clone().into(), interpolate).ok(),
         Some(image::ImageFormat::Gif) => Image::from_gif(data.clone().into(), interpolate).ok(),
@@ -1289,7 +1293,6 @@ fn lossless(data: &Arc<Vec<u8>>, fmt: Option<image::ImageFormat>, interpolate: b
     };
     direct.or_else(|| {
         // TIFF, BMP, PSD composites…
-        let rgba = designcraft_images::decode_rgba(data)?;
         let (w, h) = rgba.dimensions();
         Some(Image::from_rgba8(rgba.into_raw(), w, h))
     })
